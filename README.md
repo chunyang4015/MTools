@@ -2,6 +2,17 @@
 
 一款 macOS 效率工具箱，全局快捷键呼出，输入即搜索，内置多种开发常用工具，支持本地 AI 翻译。
 
+## 截图
+
+<p align="center">
+  <img src="screenshots/screenshots1.png" width="45%" />
+  <img src="screenshots/screenshots2.png" width="45%" />
+</p>
+<p align="center">
+  <img src="screenshots/screenshots3.png" width="45%" />
+  <img src="screenshots/screenshots4.png" width="45%" />
+</p>
+
 ## 特性
 
 - **全局呼出** — 快捷键随时唤起搜索框，用完即走
