@@ -1,0 +1,27 @@
+# Build output
+src-tauri/target/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Tauri dev cache
+src-tauri/Cargo.lock
+
+# Playwright MCP logs
+.playwright-mcp/

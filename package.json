@@ -1,0 +1,12 @@
+{
+  "name": "mtools",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "npx tauri dev",
+    "build": "npx tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/cli": "^2.11.2"
+  }
+}
