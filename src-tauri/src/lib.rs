@@ -115,15 +115,23 @@ fn run_inference(
     ctx.decode(&mut batch)
         .map_err(|e| format!("处理输入失败: {e}"))?;
 
+    // Sampler chain: penalties + truncation suppress the low-probability tail
+    // that causes garbled CJK output (dropped/extra chars, stray spaces).
     let mut sampler = LlamaSampler::chain(
         [
+            LlamaSampler::penalties(-1, 1.1, 0.0, 0.0), // repeat penalty over full context
+            LlamaSampler::top_k(40),                     // keep only top-40 tokens
+            LlamaSampler::top_p(0.9, 1),                 // nucleus truncation
             LlamaSampler::temp(0.3),
             LlamaSampler::dist(0),
         ],
         false,
     );
 
-    let mut output = String::new();
+    // Accumulate raw bytes and decode once after the loop. Per-token decoding
+    // with a fresh decoder drops multi-byte UTF-8 chars split across token
+    // boundaries (common for CJK in byte-BPE vocabularies), causing lost chars.
+    let mut output_bytes: Vec<u8> = Vec::new();
     let mut n_cur = tokens.len() as i32;
 
     for _ in 0..max_tokens {
@@ -132,10 +140,16 @@ fn run_inference(
 
         if model.is_eog_token(new_token) { break; }
 
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let piece = model.token_to_piece(new_token, &mut decoder, false, None)
-            .map_err(|e| format!("解码失败: {e}"))?;
-        output.push_str(&piece);
+        let bytes = match model.token_to_piece_bytes(new_token, 8, false, None) {
+            Ok(b) => b,
+            Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(n)) => {
+                let need = n.unsigned_abs() as usize;
+                model.token_to_piece_bytes(new_token, need, false, None)
+                    .map_err(|e| format!("解码失败: {e}"))?
+            }
+            Err(e) => return Err(format!("解码失败: {e}")),
+        };
+        output_bytes.extend_from_slice(&bytes);
 
         batch.clear();
         batch.add(new_token, n_cur, &[0], true)
@@ -150,8 +164,10 @@ fn run_inference(
             .map_err(|e| format!("推理失败: {e}"))?;
     }
 
+    let output = String::from_utf8(output_bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
     let result = output.trim();
-    // Strip <think >...</think > blocks from reasoning models (e.g. Qwen3, DeepSeek)
+    // Strip <think>...</think> blocks from reasoning models (e.g. Qwen3, DeepSeek)
     let result = strip_think_tags(result);
     Ok(result.to_string())
 }
@@ -183,9 +199,18 @@ fn strip_think_tags(text: &str) -> String {
 struct AppInfo {
     name: String,
     path: String,
+    #[serde(rename = "pinyinFull")]
+    pinyin_full: String,
+    #[serde(rename = "pinyinInitials")]
+    pinyin_initials: String,
 }
 
-static APP_CACHE: OnceLock<Vec<AppInfo>> = OnceLock::new();
+struct AppCache {
+    apps: Vec<AppInfo>,
+    mtimes: Vec<Option<std::time::SystemTime>>,
+}
+
+static APP_CACHE: Mutex<Option<AppCache>> = Mutex::new(None);
 static CACHED_WIDTH: OnceLock<f64> = OnceLock::new();
 
 // ========== 配置管理 ==========
@@ -230,6 +255,8 @@ struct AppConfig {
     llm: LlmConfig,
     #[serde(default)]
     tool_shortcuts: HashMap<String, String>,
+    #[serde(default)]
+    terminal: String,
 }
 
 static APP_CONFIG: OnceLock<Mutex<AppConfig>> = OnceLock::new();
@@ -240,6 +267,7 @@ fn default_config() -> AppConfig {
         auto_start: false,
         llm: LlmConfig::default(),
         tool_shortcuts: HashMap::new(),
+        terminal: String::new(),
     }
 }
 
@@ -390,6 +418,7 @@ fn get_settings() -> Result<serde_json::Value, String> {
             "localModelPath": config.llm.local_model_path,
         },
         "toolShortcuts": config.tool_shortcuts,
+        "terminal": config.terminal,
     }))
 }
 
@@ -453,6 +482,89 @@ fn set_autostart_setting(_app: tauri::AppHandle, enabled: bool) -> Result<(), St
     Ok(())
 }
 
+/// Build a lowercase full-pinyin string and an initials string for fuzzy app search.
+/// CJK characters map to their pinyin; other characters are kept (lowercased) so
+/// mixed names like "Xcode" or "微信" still match.
+fn compute_app_pinyin(name: &str) -> (String, String) {
+    use pinyin::ToPinyin;
+    let mut full = String::with_capacity(name.len() * 3);
+    let mut initials = String::with_capacity(name.len());
+    for (ch, py) in name.chars().zip(name.to_pinyin()) {
+        match py {
+            Some(p) => {
+                full.push_str(p.plain());
+                initials.push_str(p.first_letter());
+            }
+            None => {
+                let lower = ch.to_ascii_lowercase();
+                full.push(lower);
+                if lower.is_ascii_alphabetic() {
+                    initials.push(lower);
+                }
+            }
+        }
+    }
+    (full, initials)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_app_pinyin;
+
+    // Reproduces the user scenario: searching "qianwen" must match "通义千问".
+    #[test]
+    fn app_pinyin_full_and_initials() {
+        assert_eq!(
+            compute_app_pinyin("通义千问"),
+            ("tongyiqianwen".to_string(), "tyqw".to_string())
+        );
+    }
+
+    // Characters missing from the old frontend dict (微/信) now resolve via the full Unihan table.
+    #[test]
+    fn app_pinyin_resolves_uncovered_chars() {
+        assert_eq!(
+            compute_app_pinyin("微信"),
+            ("weixin".to_string(), "wx".to_string())
+        );
+    }
+
+    // Non-CJK characters are lowercased; alphabetic ones contribute to initials.
+    #[test]
+    fn app_pinyin_keeps_ascii() {
+        assert_eq!(
+            compute_app_pinyin("Xcode"),
+            ("xcode".to_string(), "xcode".to_string())
+        );
+    }
+}
+
+/// Resolve the user-visible (zh-localized) app name from the bundle's InfoPlist.strings.
+/// Returns None when no localization is present, so the caller falls back to the filename.
+#[cfg(target_os = "macos")]
+fn localized_app_name(path: &str) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    extern "C" {
+        fn macos_get_app_display_name(app_path: *const i8) -> *const i8;
+        fn free(ptr: *mut std::ffi::c_void);
+    }
+    unsafe {
+        let c = CString::new(path).ok()?;
+        let raw = macos_get_app_display_name(c.as_ptr());
+        if raw.is_null() {
+            return None;
+        }
+        let name = CStr::from_ptr(raw).to_string_lossy().into_owned();
+        free(raw as *mut _);
+        Some(name)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn localized_app_name(_path: &str) -> Option<String> {
+    None
+}
+
 fn scan_dir(dir: &std::path::Path, apps: &mut Vec<AppInfo>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -461,35 +573,69 @@ fn scan_dir(dir: &std::path::Path, apps: &mut Vec<AppInfo>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().map_or(false, |e| e == "app") && path.is_dir() {
-            let name = path
+            let stem = path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
+            let name = localized_app_name(&path.to_string_lossy()).unwrap_or(stem);
             if !name.is_empty() {
+                let (pinyin_full, pinyin_initials) = compute_app_pinyin(&name);
                 apps.push(AppInfo {
                     name,
                     path: path.to_string_lossy().into(),
+                    pinyin_full,
+                    pinyin_initials,
                 });
             }
         }
     }
 }
 
+/// Application directories scanned at runtime (top-level only, like Finder).
+fn app_scan_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/System/Applications"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(std::path::PathBuf::from(format!("{home}/Applications")));
+    }
+    dirs
+}
+
+fn dir_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 #[tauri::command]
-fn scan_applications() -> Vec<AppInfo> {
-    APP_CACHE
-        .get_or_init(|| {
-            let mut apps = Vec::new();
-            scan_dir(std::path::Path::new("/Applications"), &mut apps);
-            scan_dir(std::path::Path::new("/System/Applications"), &mut apps);
-            if let Ok(home) = std::env::var("HOME") {
-                scan_dir(std::path::Path::new(&format!("{home}/Applications")), &mut apps);
+async fn scan_applications() -> Vec<AppInfo> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dirs = app_scan_dirs();
+        let current_mtimes: Vec<Option<std::time::SystemTime>> =
+            dirs.iter().map(|d| dir_mtime(d)).collect();
+
+        let mut cache = APP_CACHE.lock().expect("APP_CACHE poisoned");
+        // Reuse the cached list when no scanned directory has changed on disk, so a
+        // newly installed app only triggers one rescan — after its directory's mtime
+        // updates (macOS bumps the parent dir mtime on add/remove).
+        if let Some(c) = cache.as_ref() {
+            if c.mtimes == current_mtimes {
+                return c.apps.clone();
             }
-            apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            apps
-        })
-        .clone()
+        }
+
+        let mut apps = Vec::new();
+        for dir in &dirs {
+            scan_dir(dir, &mut apps);
+        }
+        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        let result = apps.clone();
+        *cache = Some(AppCache { apps, mtimes: current_mtimes });
+        result
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -499,6 +645,196 @@ fn launch_application(path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ========== Folder clipboard actions: VSCode / Terminal ==========
+
+/// Known terminal candidates: (id, app bundle basename, display name).
+const TERMINAL_CANDIDATES: &[(&str, &str, &str)] = &[
+    ("terminal", "Terminal", "Terminal"),
+    ("iterm", "iTerm", "iTerm2"),
+    ("warp", "Warp", "Warp"),
+    ("ghostty", "Ghostty", "Ghostty"),
+    ("alacritty", "Alacritty", "Alacritty"),
+    ("kitty", "kitty", "kitty"),
+    ("hyper", "Hyper", "Hyper"),
+    ("wezterm", "WezTerm", "WezTerm"),
+];
+
+#[derive(serde::Serialize)]
+struct TerminalInfo {
+    id: String,
+    name: String,
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_app_basename(id: &str) -> Option<&'static str> {
+    TERMINAL_CANDIDATES
+        .iter()
+        .find(|(i, _, _)| *i == id)
+        .map(|(_, b, _)| *b)
+}
+
+/// Escape a string for safe interpolation inside an AppleScript double-quoted string.
+#[cfg(target_os = "macos")]
+fn esc_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Persist the user's chosen default terminal id (empty = none selected).
+#[tauri::command]
+fn set_terminal_setting(id: String) -> Result<(), String> {
+    let cfg_path = config_file_path();
+    let config_snapshot = {
+        let mut config = APP_CONFIG.get().unwrap().lock().unwrap();
+        config.terminal = id;
+        config.clone()
+    };
+    save_config(&config_snapshot, &cfg_path);
+    Ok(())
+}
+
+/// Scan /Applications and ~/Applications for known terminal apps.
+#[tauri::command]
+async fn scan_installed_terminals() -> Vec<TerminalInfo> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        TERMINAL_CANDIDATES
+            .iter()
+            .filter_map(|(id, app, display)| {
+                let exists = if *id == "terminal" {
+                    std::path::Path::new("/System/Applications/Utilities/Terminal.app").exists()
+                } else {
+                    std::path::Path::new(&format!("/Applications/{}.app", app)).exists()
+                        || std::path::Path::new(&format!("{}/Applications/{}.app", home, app))
+                            .exists()
+                };
+                if exists {
+                    Some(TerminalInfo {
+                        id: id.to_string(),
+                        name: display.to_string(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Whether standard Visual Studio Code is installed.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn vscode_installed() -> bool {
+    tauri::async_runtime::spawn_blocking(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::Path::new("/Applications/Visual Studio Code.app").exists()
+            || std::path::Path::new(&format!("{}/Applications/Visual Studio Code.app", home))
+                .exists()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn vscode_installed() -> bool {
+    false
+}
+
+/// Return the folder path if the clipboard holds exactly one directory.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn get_clipboard_folder() -> Option<String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let paths = macos_clipboard::read_files()?;
+        if paths.len() == 1 {
+            let p = std::path::Path::new(&paths[0]);
+            if p.is_dir() {
+                return Some(paths[0].clone());
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn get_clipboard_folder() -> Option<String> {
+    None
+}
+
+/// Open a folder in Visual Studio Code.
+#[tauri::command]
+async fn open_in_vscode(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg("Visual Studio Code")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+/// Open a terminal at the given directory (cd into it) using the configured terminal.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn open_in_terminal(dir: String, terminal: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let escaped = esc_applescript(&dir);
+        match terminal.as_str() {
+            "terminal" => {
+                let script = format!(
+                    "tell application \"Terminal\"\ndo script \"cd \" & quoted form of \"{}\"\nactivate\nend tell",
+                    escaped
+                );
+                std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(&script)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+            "iterm" => {
+                let script = format!(
+                    "tell application \"iTerm\"\ncreate window with default profile\ntell current session of current window\nwrite text \"cd \" & quoted form of \"{}\"\nend tell\nactivate\nend tell",
+                    escaped
+                );
+                std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg(&script)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+            other => {
+                let app = terminal_app_basename(other).unwrap_or(other);
+                std::process::Command::new("open")
+                    .arg("-a")
+                    .arg(app)
+                    .arg(&dir)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn open_in_terminal(_dir: String, _terminal: String) -> Result<(), String> {
+    Err("unsupported platform".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -1505,14 +1841,14 @@ async fn translate_to_naming(text: String) -> Result<serde_json::Value, String> 
             return Err(format!("模型文件不存在: {model_path}"));
         }
 
-        let system_prompt = "将中文翻译为英文变量名。直接翻译原意，不要添加多余词汇。每行一个，用 camelCase，不要解释。";
+        let system_prompt = "将中文翻译为英文，用于生成变量名。直接翻译原意，不要添加多余词汇。每行一个，用空格分隔单词（例如 user name），不要解释。";
         let user_content = format!("翻译以下中文：{text}");
 
         return tauri::async_runtime::spawn_blocking(move || {
             let messages: Vec<(&str, &str)> = vec![
                 ("system", system_prompt),
                 ("user", "翻译以下中文：用户名"),
-                ("assistant", "userName"),
+                ("assistant", "user name"),
                 ("user", "翻译以下中文：翻译"),
                 ("assistant", "translate"),
                 ("user", &user_content),
@@ -1540,7 +1876,7 @@ async fn translate_to_naming(text: String) -> Result<serde_json::Value, String> 
     let url = format!("{}/v1/chat/completions", api_url.trim_end_matches('/'));
 
     let prompt = format!(
-        "你是一个专业的编程命名翻译助手。将用户输入的中文翻译为简洁的英文编程变量名。\n\n规则：\n- 只输出英文翻译，不要解释\n- 如果输入包含多个概念，提供多个建议，每行一个\n- 翻译要简洁、符合编程惯例\n- 不要包含标点符号\n\n用户输入：{text}"
+        "将中文翻译为英文，用于生成变量名。直接翻译原意，不要添加多余词汇。每行一个，用空格分隔单词（例如 user name），不要解释。\n\n用户输入：{text}"
     );
 
     let body = serde_json::json!({
@@ -1583,16 +1919,28 @@ async fn translate_to_naming(text: String) -> Result<serde_json::Value, String> 
     Ok(serde_json::json!({ "suggestions": suggestions }))
 }
 
-/// Detect if text contains CJK characters
-fn contains_cjk(text: &str) -> bool {
-    text.chars().any(|c| {
+/// Decide translation direction by dominant script.
+/// Returns true when CJK characters outnumber Latin letters (translate to
+/// English), false otherwise (translate to Chinese). Using proportions
+/// instead of mere presence lets mixed text — e.g. an English sentence with
+/// a few Chinese words — resolve to its dominant language.
+fn is_predominantly_chinese(text: &str) -> bool {
+    let mut cjk = 0usize;
+    let mut latin = 0usize;
+    for c in text.chars() {
         let cp = c as u32;
-        (0x4E00..=0x9FFF).contains(&cp)      // CJK Unified Ideographs
-            || (0x3400..=0x4DBF).contains(&cp) // CJK Extension A
-            || (0x3000..=0x303F).contains(&cp) // CJK Symbols
-            || (0x3040..=0x309F).contains(&cp) // Hiragana
-            || (0x30A0..=0x30FF).contains(&cp) // Katakana
-    })
+        let is_cjk = (0x4E00..=0x9FFF).contains(&cp)      // CJK Unified Ideographs
+            || (0x3400..=0x4DBF).contains(&cp)             // CJK Extension A
+            || (0x3000..=0x303F).contains(&cp)             // CJK Symbols
+            || (0x3040..=0x309F).contains(&cp)             // Hiragana
+            || (0x30A0..=0x30FF).contains(&cp);            // Katakana
+        if is_cjk {
+            cjk += 1;
+        } else if c.is_ascii_alphabetic() {
+            latin += 1;
+        }
+    }
+    cjk > latin
 }
 
 #[tauri::command]
@@ -1619,7 +1967,7 @@ async fn translate_text(text: String) -> Result<serde_json::Value, String> {
         }
     };
 
-    let is_chinese = contains_cjk(&text);
+    let is_chinese = is_predominantly_chinese(&text);
 
     if effective_runtime == "embedded" {
         let model_path = if !local_model_path.is_empty() {
@@ -1840,7 +2188,13 @@ pub fn run() {
             delete_pending_download,
             pick_gguf_file,
             search_models,
-            list_model_files
+            list_model_files,
+            set_terminal_setting,
+            scan_installed_terminals,
+            vscode_installed,
+            get_clipboard_folder,
+            open_in_vscode,
+            open_in_terminal
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

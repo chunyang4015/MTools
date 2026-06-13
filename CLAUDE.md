@@ -62,9 +62,11 @@ Rust 代码改动后需手动触发重编译：`cd src-tauri && cargo build`
 
 每次唤醒搜索框时检测剪贴板内容，匹配到的工具以描述文字展示在搜索结果中。**同一条剪贴板内容只提示一次**——关闭窗口、选了其他工具、或点击检测到的工具后，只要剪贴板不变就不重复提示。通过 `lastDetectedClipboard` 指纹（`changeCount` + 文本 + 文件路径）去重。支持文本剪贴板（`readClipboardText`）和文件剪贴板（`get_clipboard_files`，检测 PDF 等文件类型）。**当多个工具同时匹配时，翻译工具优先置顶**，方便快速按 Enter 打开。
 
+**文件夹直达动作**：当剪贴板恰好是单个文件夹（`get_clipboard_folder` 判定）时，额外提示两个直接动作（动作型，非工具面板，点击即执行并关闭窗口）：VSCode 已安装（`vscode_installed`）则提示「用 VSCode 打开」；设置页选了默认终端（`config.terminal`）则提示「在 {终端名} 打开」。终端名来自启动时缓存的 `scan_installed_terminals` 结果（id → 显示名）。执行分别走 `open_in_vscode` / `open_in_terminal`（Terminal、iTerm2 用 AppleScript `cd`，其余终端用 `open -a`）。
+
 ## Rust 后端命令
 
-完整命令表（24 个）→ [docs/rust-backend.md](docs/rust-backend.md)
+完整命令表 → [docs/rust-backend.md](docs/rust-backend.md)
 
 关键规则：**所有涉及 macOS 原生 API 的命令必须用 `async` + `spawn_blocking`**，否则阻塞主线程导致 WebView 输入卡顿。仅纯计算或纯数据操作可以用同步命令。
 
@@ -73,6 +75,8 @@ Rust 代码改动后需手动触发重编译：`cd src-tauri && cargo build`
 ## 配置持久化
 
 配置文件：`~/Library/Application Support/com.mtools.app/config.json`
+
+主要字段：`shortcut`（全局快捷键）、`autoStart`（开机自启）、`terminal`（默认终端 id，用于文件夹直达，空串=未选）、`llm`（AI 运行时/模型）、`toolShortcuts`（工具直达快捷键）。
 
 详细配置结构和字段说明 → [docs/rust-backend.md](docs/rust-backend.md)
 

@@ -19,6 +19,9 @@ const MAX_APP_RESULTS = 5;
 const PANEL_H = 560;
 const MAX_TABS = 5;
 
+const VSCODE_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="#0098FF" d="M17.5 2.5 9.2 10 5 6.5 3 8l4 4-4 4 2 1.5 4.2-3.5 8.3 7.5 3.5-1.5V4l-3.5-1.5zm0 4.2v10.6L11.5 12l6-5.3z"/></svg>';
+const TERMINAL_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/></svg>';
+
 // 状态
 let currentView = 'search';
 let results = [];
@@ -29,6 +32,7 @@ let clipboardText = '';
 let lastDetectedClipboard = '';
 let lastActiveToolId = null;
 let isPinned = false;
+let terminalNameMap = {};
 window._skipBlur = false;
 
 // ========== 窗口大小 ==========
@@ -147,6 +151,38 @@ async function detectClipboard() {
     } catch {}
   }
 
+  // 文件夹检测：提示用 VSCode / 终端打开
+  if (window.__TAURI__) {
+    try {
+      const folder = await window.__TAURI__.core.invoke('get_clipboard_folder');
+      if (folder) {
+        const [hasVscode, settings] = await Promise.all([
+          window.__TAURI__.core.invoke('vscode_installed'),
+          window.__TAURI__.core.invoke('get_settings'),
+        ]);
+        const baseName = folder.split('/').pop() || folder;
+        if (hasVscode) {
+          detected.push({
+            folderAction: { type: 'vscode', folder },
+            icon: VSCODE_ICON,
+            name: '用 VSCode 打开',
+            desc: `用 VSCode 打开「${baseName}」`,
+          });
+        }
+        if (settings.terminal) {
+          const terminalName = terminalNameMap[settings.terminal] || settings.terminal;
+          detected.push({
+            folderAction: { type: 'terminal', folder, terminalId: settings.terminal },
+            icon: TERMINAL_ICON,
+            name: `在 ${terminalName} 打开`,
+            desc: `打开目录「${baseName}」`,
+          });
+        }
+        if (!clipboardText) clipboardText = folder;
+      }
+    } catch {}
+  }
+
   if (detected.length === 0) return;
 
   // 同一条剪贴板内容只提示一次；changeCount 变化（重复制）则重新检测
@@ -162,11 +198,22 @@ async function detectClipboard() {
   }
   // 翻译工具优先置顶，方便快速打开
   detected.sort((a, b) => {
-    if (a.tool.id === 'translator') return -1;
-    if (b.tool.id === 'translator') return 1;
+    if (a.tool?.id === 'translator') return -1;
+    if (b.tool?.id === 'translator') return 1;
     return 0;
   });
-  results = detected.map(d => ({ ...d.tool, _clipboardDesc: d.desc }));
+  results = detected.map(d => {
+    if (d.folderAction) {
+      return {
+        id: 'folder-action-' + d.folderAction.type,
+        name: d.name,
+        icon: d.icon,
+        _clipboardDesc: d.desc,
+        _folderAction: d.folderAction,
+      };
+    }
+    return { ...d.tool, _clipboardDesc: d.desc };
+  });
   selectedIdx = 0;
   renderResults(true);
   resizeWindow(BAR_H + results.length * ITEM_H);
@@ -179,6 +226,29 @@ async function handleAppClick(appPath) {
   if (window.__TAURI__) {
     window.__TAURI__.window.getCurrentWindow().hide();
   }
+}
+
+async function handleFolderAction(action) {
+  if (!window.__TAURI__) return;
+  try {
+    if (action.type === 'vscode') {
+      await window.__TAURI__.core.invoke('open_in_vscode', { path: action.folder });
+    } else if (action.type === 'terminal') {
+      await window.__TAURI__.core.invoke('open_in_terminal', { dir: action.folder, terminal: action.terminalId });
+    }
+  } catch (e) {
+    console.error('[MTools] handleFolderAction:', e);
+  }
+  window.__TAURI__.window.getCurrentWindow().hide();
+}
+
+async function loadTerminalNames() {
+  if (!window.__TAURI__) return;
+  try {
+    const terminals = await window.__TAURI__.core.invoke('scan_installed_terminals');
+    terminalNameMap = {};
+    for (const t of terminals) terminalNameMap[t.id] = t.name;
+  } catch {}
 }
 
 // ========== 搜索 ==========
@@ -403,6 +473,10 @@ searchResults.addEventListener('click', (e) => {
   const idx = parseInt(el.dataset.idx);
   const item = results[idx];
   if (!item) return;
+  if (item._folderAction) {
+    handleFolderAction(item._folderAction);
+    return;
+  }
   if (item._isApp) {
     handleAppClick(item._appPath);
   } else {
@@ -466,6 +540,10 @@ document.addEventListener('keydown', e => {
       updateSelection();
     } else if (e.key === 'Enter') {
       const item = results[selectedIdx];
+      if (item._folderAction) {
+        handleFolderAction(item._folderAction);
+        return;
+      }
       if (item._isApp) {
         handleAppClick(item._appPath);
       } else {
@@ -483,6 +561,7 @@ if (window.__TAURI__) {
   const { getCurrentWindow } = window.__TAURI__.window;
 
   listen('window-shown', () => {
+    loadApps();
     if (lastActiveToolId) {
       const tab = tabs.find(t => t.id === lastActiveToolId);
       if (tab) {
@@ -534,3 +613,4 @@ if (window.__TAURI__) {
 searchInput.focus();
 resizeWindow(BAR_H, true);
 loadApps();
+loadTerminalNames();

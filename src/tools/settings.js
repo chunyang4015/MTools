@@ -89,6 +89,14 @@ export default {
                   <span class="toggle-slider"></span>
                 </label>
               </div>
+              <div class="settings-row">
+                <span class="settings-label">默认终端</span>
+                <div class="settings-model-select-wrap">
+                  <select class="settings-model-select" id="settings-terminal-select">
+                    <option value="">加载中...</option>
+                  </select>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -208,6 +216,7 @@ export default {
       this._currentShortcut = settings.shortcut;
       document.getElementById('settings-shortcut-input').value = formatShortcutDisplay(settings.shortcut);
       document.getElementById('settings-autostart-toggle').checked = settings.autoStart;
+      this._loadTerminals(settings.terminal);
 
       const llm = settings.llm;
       const runtimeSelect = document.getElementById('settings-llm-runtime');
@@ -225,6 +234,29 @@ export default {
       this._loadPendingDownloads();
     } catch {
       document.getElementById('settings-shortcut-input').value = formatShortcutDisplay(this._currentShortcut);
+    }
+  },
+
+  async _loadTerminals(selectedId) {
+    const select = document.getElementById('settings-terminal-select');
+    if (!select) return;
+    if (!window.__TAURI__) {
+      select.innerHTML = '<option value="">不可用</option>';
+      return;
+    }
+    try {
+      const terminals = await window.__TAURI__.core.invoke('scan_installed_terminals');
+      let html = '<option value="">未选择</option>';
+      for (const t of terminals) {
+        html += `<option value="${escHtml(t.id)}">${escHtml(t.name)}</option>`;
+      }
+      if (selectedId && !terminals.some(t => t.id === selectedId)) {
+        html += `<option value="${escHtml(selectedId)}" selected>${escHtml(selectedId)}</option>`;
+      }
+      select.innerHTML = html;
+      select.value = selectedId || '';
+    } catch {
+      select.innerHTML = '<option value="">检测失败</option>';
     }
   },
 
@@ -444,6 +476,12 @@ export default {
       } catch {
         e.target.checked = !e.target.checked;
       }
+    });
+
+    const terminalSelect = document.getElementById('settings-terminal-select');
+    terminalSelect.addEventListener('change', () => {
+      if (!window.__TAURI__) return;
+      window.__TAURI__.core.invoke('set_terminal_setting', { id: terminalSelect.value });
     });
 
     // Runtime selector

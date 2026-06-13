@@ -1,5 +1,3 @@
-import { computePinyin } from './pinyin.js';
-
 const FALLBACK_ICON = `<svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" width="20" height="20">
   <rect x="2" y="2" width="28" height="28" rx="7" fill="currentColor" opacity="0.15"/>
   <rect x="8" y="8" width="7" height="7" rx="1.5" fill="currentColor" opacity="0.5"/>
@@ -12,22 +10,17 @@ let apps = null;
 const iconCache = new Map();
 
 function precompute(raw) {
-  return raw.map((a) => {
-    const lower = a.name.toLowerCase();
-    const { full, initials } = computePinyin(a.name);
-    return { ...a, lower, pinyinFull: full, pinyinInitials: initials };
-  });
+  return raw.map((a) => ({ ...a, lower: a.name.toLowerCase() }));
 }
 
 export async function loadApps() {
-  if (apps !== null) return;
   if (!window.__TAURI__) { apps = []; return; }
   try {
     const raw = await window.__TAURI__.core.invoke('scan_applications');
     apps = precompute(raw);
   } catch (e) {
     console.error('scan_applications:', e);
-    apps = [];
+    if (apps === null) apps = [];
   }
 }
 
