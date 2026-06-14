@@ -605,6 +605,9 @@ if (window.__TAURI__) {
   pinBtn.addEventListener('click', () => setPinned(!isPinned));
 }
 
+// Expose for cross-tool navigation (e.g. open a tool from settings)
+window.mtoolsOpenTool = openTool;
+
 // 初始化
 searchInput.focus();
 resizeWindow(BAR_H, true);

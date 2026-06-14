@@ -2456,6 +2456,7 @@ body {
   background: var(--bg-input);
   border-radius: var(--radius-sm);
   transition: background 0.1s;
+  cursor: pointer;
 }
 
 .settings-tool-card:hover {

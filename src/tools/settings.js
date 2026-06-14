@@ -809,7 +809,7 @@ export default {
     container.innerHTML = tools.map(t => {
       const kwList = t.keywords.map(k => escHtml(k)).join('、');
       return `
-        <div class="settings-tool-card">
+        <div class="settings-tool-card" data-tool-id="${escHtml(t.id)}" role="button" tabindex="0">
           <div class="settings-tool-icon">${t.icon}</div>
           <div class="settings-tool-info">
             <div class="settings-tool-name">${escHtml(t.name)}</div>
@@ -822,6 +822,20 @@ export default {
           </div>
         </div>`;
     }).join('');
+
+    container.querySelectorAll('.settings-tool-card').forEach(card => {
+      const open = () => {
+        const id = card.dataset.toolId;
+        if (window.mtoolsOpenTool) window.mtoolsOpenTool(id);
+      };
+      card.addEventListener('click', open);
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open();
+        }
+      });
+    });
   },
 
   _bindSidebarTabs() {
