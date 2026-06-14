@@ -60,6 +60,8 @@ npm install
 npx tauri dev
 
 # 生产构建（输出 DMG）
+cd src-tauri 
+cargo clean   
 npx tauri build
 ```
 

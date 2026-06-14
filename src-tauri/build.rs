@@ -12,6 +12,5 @@ fn main() {
             .compile("macos_icon_and_picker");
         println!("cargo:rustc-link-lib=framework=AppKit");
     }
-    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "10.15");
     tauri_build::build()
 }

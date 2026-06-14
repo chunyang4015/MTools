@@ -256,14 +256,10 @@ async function loadTerminalNames() {
 function onSearchInput(query) {
   if (!query.trim()) {
     prevResultIds = '';
-    if (clipboardText) {
-      detectClipboard();
-    } else {
-      searchResults.innerHTML = '';
-      results = [];
-      selectedIdx = 0;
-      resizeWindow(BAR_H, true);
-    }
+    results = [];
+    selectedIdx = 0;
+    searchResults.innerHTML = '';
+    resizeWindow(BAR_H, true);
     return;
   }
 
