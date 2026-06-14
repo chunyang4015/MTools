@@ -47,6 +47,15 @@ function containsChinese(text) {
   return /[一-鿿]{1,}/.test(text);
 }
 
+function formatShortcutDisplay(str) {
+  return str
+    .replace('Alt', '⌥')
+    .replace('Cmd', '⌘')
+    .replace('Ctrl', '⌃')
+    .replace('Shift', '⇧')
+    .replace(/\+/g, ' ');
+}
+
 export default {
   id: 'naming',
   name: '变量命名',
@@ -74,6 +83,9 @@ export default {
   render(container) {
     this._formats = getFormats();
     this._llmConfig = null;
+    this._isRecordingShortcut = false;
+    this._directShortcut = '';
+    this._boundOnKeyDown = this._onKeyDown.bind(this);
 
     container.innerHTML = `
       <div class="naming-wrap">
@@ -87,8 +99,10 @@ export default {
       </div>
     `;
 
+    document.addEventListener('keydown', this._boundOnKeyDown, true);
     this._bindEvents();
     this._loadLlmConfig();
+    this._loadDirectShortcut();
   },
 
   _bindEvents() {
@@ -113,6 +127,14 @@ export default {
       const settings = await window.__TAURI__.core.invoke('get_settings');
       this._llmConfig = settings.llm;
       this._hasModel = !!(settings.llm.model || settings.llm.localModelPath);
+    } catch { }
+  },
+
+  async _loadDirectShortcut() {
+    if (!window.__TAURI__) return;
+    try {
+      const settings = await window.__TAURI__.core.invoke('get_settings');
+      this._directShortcut = settings.toolShortcuts?.naming || '';
     } catch { }
   },
 
@@ -239,6 +261,14 @@ export default {
 
     card.innerHTML = `
       <div class="translator-settings-section">
+        <div class="translator-settings-title">直达快捷键</div>
+        <div class="translator-settings-row">
+          <span class="translator-settings-desc">按下快捷键直接打开变量命名工具</span>
+          <input class="shortcut-input" id="naming-shortcut-input" readonly
+            placeholder="点击录入快捷键" value="${this._directShortcut ? formatShortcutDisplay(this._directShortcut) : ''}">
+        </div>
+      </div>
+      <div class="translator-settings-section">
         <div class="translator-settings-title">命名格式</div>
         <div class="translator-format-checks">
           ${formatCheckboxes}
@@ -251,6 +281,17 @@ export default {
       if (e.target === overlay) this.toggleSettings();
     };
 
+    const shortcutInput = document.getElementById('naming-shortcut-input');
+    shortcutInput.addEventListener('focus', () => {
+      this._isRecordingShortcut = true;
+      shortcutInput.value = '';
+      shortcutInput.placeholder = '按下快捷键组合...';
+      shortcutInput.classList.add('recording');
+    });
+    shortcutInput.addEventListener('blur', () => {
+      if (this._isRecordingShortcut) this._stopRecording();
+    });
+
     card.querySelectorAll('.translator-checkbox input').forEach(cb => {
       cb.addEventListener('change', () => {
         const checked = [...card.querySelectorAll('.translator-checkbox input:checked')].map(c => c.value);
@@ -258,6 +299,88 @@ export default {
         this._formats = checked;
       });
     });
+  },
+
+  _onKeyDown(e) {
+    if (!this._isRecordingShortcut) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+
+    const input = document.getElementById('naming-shortcut-input');
+    if (!input) return;
+
+    if (e.key === 'Escape') {
+      input.blur();
+      return;
+    }
+
+    const modSymbols = [];
+    if (e.altKey) modSymbols.push('⌥');
+    if (e.metaKey) modSymbols.push('⌘');
+    if (e.ctrlKey) modSymbols.push('⌃');
+    if (e.shiftKey) modSymbols.push('⇧');
+
+    if (['Alt', 'Meta', 'Control', 'Shift'].includes(e.key)) {
+      input.value = modSymbols.join(' ');
+      return;
+    }
+
+    if (modSymbols.length === 0) return;
+
+    const code = e.code;
+    let keyName;
+    if (code === 'Space') keyName = 'Space';
+    else if (code === 'Backquote') keyName = 'Backquote';
+    else if (code.startsWith('Key')) keyName = code.slice(3);
+    else if (code.startsWith('Digit')) keyName = code.slice(5);
+    else if (/^F\d{1,2}$/.test(code)) keyName = code;
+    else return;
+
+    const parts = [];
+    if (e.altKey) parts.push('Alt');
+    if (e.metaKey) parts.push('Cmd');
+    if (e.ctrlKey) parts.push('Ctrl');
+    if (e.shiftKey) parts.push('Shift');
+    parts.push(keyName);
+    const shortcut = parts.join('+');
+
+    this._isRecordingShortcut = false;
+    input.value = formatShortcutDisplay(shortcut);
+    input.classList.remove('recording');
+    input.placeholder = '点击录入快捷键';
+
+    if (!window.__TAURI__) return;
+
+    if (this._directShortcut) {
+      window.__TAURI__.core.invoke('unregister_tool_shortcut', { toolId: 'naming' }).catch(() => { });
+    }
+
+    window.__TAURI__.core.invoke('register_tool_shortcut', {
+      toolId: 'naming',
+      shortcut,
+    }).then(() => {
+      this._directShortcut = shortcut;
+      input.blur();
+    }).catch((err) => {
+      input.value = err || '注册失败';
+      input.classList.add('error');
+      input.classList.remove('recording');
+      setTimeout(() => {
+        input.value = this._directShortcut ? formatShortcutDisplay(this._directShortcut) : '';
+        input.classList.remove('error');
+        input.blur();
+      }, 1500);
+    });
+  },
+
+  _stopRecording() {
+    this._isRecordingShortcut = false;
+    const input = document.getElementById('naming-shortcut-input');
+    if (input) {
+      input.value = this._directShortcut ? formatShortcutDisplay(this._directShortcut) : '';
+      input.classList.remove('recording');
+      input.placeholder = '点击录入快捷键';
+    }
   },
 
   toolbar: [
@@ -288,5 +411,9 @@ export default {
     },
   ],
 
-  destroy() {},
+  destroy() {
+    if (this._boundOnKeyDown) {
+      document.removeEventListener('keydown', this._boundOnKeyDown, true);
+    }
+  },
 };
