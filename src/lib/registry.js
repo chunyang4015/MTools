@@ -11,6 +11,7 @@ import settings from '../tools/settings.js';
 import pdfTools from '../tools/pdf-tools.js';
 import naming from '../tools/naming.js';
 import translator from '../tools/translator.js';
+import hostManager from '../tools/host-manager.js';
 import { computePinyin } from './pinyin.js';
 
 function precompute(raw) {
@@ -45,6 +46,7 @@ const tools = precompute([
   pdfTools,
   naming,
   translator,
+  hostManager,
 ]);
 
 function matchTool(t, q) {

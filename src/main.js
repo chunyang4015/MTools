@@ -588,7 +588,7 @@ if (window.__TAURI__) {
   document.addEventListener('mousedown', (e) => {
     if (e.button !== 0) return;
     const el = e.target;
-    if (el.closest('input, textarea, button, select, .result-item, .tab-close, .toolbar-btn, .color-wheel-lg, .color-swatch, .color-preview-lg, .color-tab, .toggle-switch, #pin-btn')) return;
+    if (el.closest('input, textarea, button, select, .result-item, .tab-close, .toolbar-btn, .color-wheel-lg, .color-swatch, .color-preview-lg, .color-tab, .toggle-switch, #pin-btn, .host-group-item')) return;
     getCurrentWindow().startDragging();
   });
 

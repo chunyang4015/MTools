@@ -681,6 +681,14 @@ fn esc_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Single-quote a string for safe interpolation into a POSIX shell command.
+/// Uses the standard '\'' escaping so paths with spaces/special chars are safe.
+/// (esc_applescript handles the outer AppleScript layer; this handles the inner sh layer.)
+#[cfg(target_os = "macos")]
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Persist the user's chosen default terminal id (empty = none selected).
 #[tauri::command]
 fn set_terminal_setting(id: String) -> Result<(), String> {
@@ -834,6 +842,93 @@ async fn open_in_terminal(dir: String, terminal: String) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
 async fn open_in_terminal(_dir: String, _terminal: String) -> Result<(), String> {
+    Err("unsupported platform".into())
+}
+
+/// Apply merged hosts content to /etc/hosts via osascript with administrator privileges.
+/// Steps (run as root): backup -> install (mode 644, root:wheel) -> flush DNS -> cleanup.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn apply_hosts(content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        // 1) write content to a temp file (root bypasses unix perms, can read $TMPDIR)
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir()
+            .join(format!("mtools-hosts-{}-{}.txt", std::process::id(), nanos));
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            return Err(format!("写入临时文件失败: {}", e));
+        }
+
+        // 2) build shell command (single-quote the temp path; no double quotes anywhere)
+        let tmp_q = shell_single_quote(&tmp.to_string_lossy());
+        let shell_cmd = format!(
+            "cp /etc/hosts /etc/hosts.mtools.bak && \
+             install -m 644 -o root -g wheel {tmp_q} /etc/hosts && \
+             (dscacheutil -flushcache; killall -HUP mDNSResponder || true) && \
+             rm -f {tmp_q}"
+        );
+        // wrap in AppleScript (esc_applescript is defensive — shell_cmd has no double quotes)
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            esc_applescript(&shell_cmd)
+        );
+
+        // 3) run osascript and wait (we care about success / cancel)
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        // belt-and-suspenders cleanup if install failed before the rm
+        let _ = std::fs::remove_file(&tmp);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let code = output.status.code().unwrap_or(-1);
+            let msg = stderr.trim();
+            // user clicked Cancel on the system password prompt
+            if msg.contains("-128")
+                || msg.to_lowercase().contains("user canceled")
+                || msg.contains("用户取消")
+            {
+                return Err("用户取消授权".into());
+            }
+            if msg.is_empty() {
+                return Err(format!("应用失败（退出码 {}）", code));
+            }
+            return Err(msg.to_string());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn apply_hosts(_content: String) -> Result<(), String> {
+    Err("unsupported platform".into())
+}
+
+/// Read the current /etc/hosts (world-readable, no sudo needed).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn read_system_hosts() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        std::fs::read_to_string("/etc/hosts").map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn read_system_hosts() -> Result<String, String> {
     Err("unsupported platform".into())
 }
 
@@ -2194,7 +2289,9 @@ pub fn run() {
             vscode_installed,
             get_clipboard_folder,
             open_in_vscode,
-            open_in_terminal
+            open_in_terminal,
+            apply_hosts,
+            read_system_hosts
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
