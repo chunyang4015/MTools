@@ -845,13 +845,157 @@ async fn open_in_terminal(_dir: String, _terminal: String) -> Result<(), String>
     Err("unsupported platform".into())
 }
 
-/// Apply merged hosts content to /etc/hosts via osascript with administrator privileges.
-/// Steps (run as root): backup -> install (mode 644, root:wheel) -> flush DNS -> cleanup.
+// --- Passwordless hosts writer ----------------------------------------------
+// Writing /etc/hosts requires root. To avoid a password prompt on every toggle we
+// install (once, via a single administrator prompt) a fixed root-owned helper plus a
+// sudoers rule granting ONLY the current user passwordless access to that ONE script.
+// apply_hosts then prefers `sudo -n <helper>` and falls back to the interactive prompt
+// if the helper is missing or the rule broke.
+
+#[cfg(target_os = "macos")]
+const HOSTS_HELPER_DIR: &str = "/Library/MTools";
+
+#[cfg(target_os = "macos")]
+const HOSTS_HELPER_PATH: &str = "/Library/MTools/mtools-apply-hosts.sh";
+
+#[cfg(target_os = "macos")]
+const HOSTS_SUDOERS_PATH: &str = "/etc/sudoers.d/mtools_hosts";
+
+/// Helper body: reads merged hosts from stdin, backs up + installs + flushes DNS.
+#[cfg(target_os = "macos")]
+const HOSTS_HELPER_SCRIPT: &str = r#"#!/bin/sh
+# MTools hosts applier — invoked via `sudo -n`; reads merged hosts from stdin.
+set -e
+TMP=$(mktemp /tmp/mtools-hosts.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+cat > "$TMP"
+cp /etc/hosts /etc/hosts.mtools.bak
+install -m 644 -o root -g wheel "$TMP" /etc/hosts
+dscacheutil -flushcache 2>/dev/null || true
+killall -HUP mDNSResponder 2>/dev/null || true
+"#;
+
+/// Turn an osascript failure's stderr into a user-facing message (recognizes Cancel).
+#[cfg(target_os = "macos")]
+fn osascript_err(stderr: &str, fallback: &str) -> String {
+    let msg = stderr.trim();
+    if msg.contains("-128")
+        || msg.to_lowercase().contains("user canceled")
+        || msg.contains("用户取消")
+    {
+        return "用户取消授权".into();
+    }
+    if msg.is_empty() {
+        fallback.to_string()
+    } else {
+        msg.to_string()
+    }
+}
+
+/// Whether the passwordless helper + sudoers rule are installed.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn is_hosts_helper_ready() -> bool {
+    std::path::Path::new(HOSTS_HELPER_PATH).exists()
+        && std::path::Path::new(HOSTS_SUDOERS_PATH).exists()
+}
+
+/// Install the root-owned helper + a scoped NOPASSWD sudoers rule (one admin prompt).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn install_hosts_helper() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| -> Result<(), String> {
+        // 1) stage helper script + sudoers rule in temp files (user-space)
+        let pid = std::process::id();
+        let helper_tmp = std::env::temp_dir().join(format!("mtools-helper-{pid}.sh"));
+        let sudoers_tmp = std::env::temp_dir().join(format!("mtools-sudoers-{pid}.txt"));
+        let user = std::env::var("USER").unwrap_or_else(|_| String::from("ALL"));
+        let sudoers_rule = format!("{} ALL=(root) NOPASSWD: {}\n", user, HOSTS_HELPER_PATH);
+        std::fs::write(&helper_tmp, HOSTS_HELPER_SCRIPT)
+            .map_err(|e| format!("写入临时文件失败: {}", e))?;
+        std::fs::write(&sudoers_tmp, sudoers_rule)
+            .map_err(|e| format!("写入临时文件失败: {}", e))?;
+
+        // 2) privileged: validate sudoers syntax first, then install both files root-owned
+        let cmd = format!(
+            "visudo -cf {st} && \
+             mkdir -p {dir} && \
+             chown root:wheel {dir} && \
+             chmod 755 {dir} && \
+             install -m 755 -o root -g wheel {ht} {hp} && \
+             install -m 440 -o root -g wheel {st} {sp}",
+            dir = HOSTS_HELPER_DIR,
+            ht = shell_single_quote(&helper_tmp.to_string_lossy()),
+            hp = shell_single_quote(HOSTS_HELPER_PATH),
+            st = shell_single_quote(&sudoers_tmp.to_string_lossy()),
+            sp = shell_single_quote(HOSTS_SUDOERS_PATH),
+        );
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            esc_applescript(&cmd)
+        );
+
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        let _ = std::fs::remove_file(&helper_tmp);
+        let _ = std::fs::remove_file(&sudoers_tmp);
+
+        if !output.status.success() {
+            return Err(osascript_err(
+                &String::from_utf8_lossy(&output.stderr),
+                &format!("安装失败（退出码 {}）", output.status.code().unwrap_or(-1)),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+/// Remove the helper + sudoers rule (one admin prompt).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+async fn uninstall_hosts_helper() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| -> Result<(), String> {
+        let cmd = format!(
+            "rm -f {hp} {sp}",
+            hp = shell_single_quote(HOSTS_HELPER_PATH),
+            sp = shell_single_quote(HOSTS_SUDOERS_PATH),
+        );
+        let script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            esc_applescript(&cmd)
+        );
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(osascript_err(
+                &String::from_utf8_lossy(&output.stderr),
+                &format!("卸载失败（退出码 {}）", output.status.code().unwrap_or(-1)),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+/// Apply merged hosts to /etc/hosts. Prefers the passwordless helper; falls back to a
+/// one-shot administrator prompt if the helper is not installed or the rule is broken.
 #[cfg(target_os = "macos")]
 #[tauri::command]
 async fn apply_hosts(content: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        // 1) write content to a temp file (root bypasses unix perms, can read $TMPDIR)
+        // 1) write merged content to a temp file (root can read $TMPDIR)
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -862,7 +1006,30 @@ async fn apply_hosts(content: String) -> Result<(), String> {
             return Err(format!("写入临时文件失败: {}", e));
         }
 
-        // 2) build shell command (single-quote the temp path; no double quotes anywhere)
+        // 2) prefer the passwordless helper when installed (no system prompt)
+        if std::path::Path::new(HOSTS_HELPER_PATH).exists()
+            && std::path::Path::new(HOSTS_SUDOERS_PATH).exists()
+        {
+            let ok = std::fs::File::open(&tmp)
+                .and_then(|f| {
+                    std::process::Command::new("sudo")
+                        .arg("-n")
+                        .arg(HOSTS_HELPER_PATH)
+                        .stdin(std::process::Stdio::from(f))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                })
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(());
+            }
+            // helper missing or sudoers rule broken -> fall back to interactive prompt
+        }
+
+        // 3) fallback: one-shot administrator prompt (backup -> install -> flush -> cleanup)
         let tmp_q = shell_single_quote(&tmp.to_string_lossy());
         let shell_cmd = format!(
             "cp /etc/hosts /etc/hosts.mtools.bak && \
@@ -870,37 +1037,22 @@ async fn apply_hosts(content: String) -> Result<(), String> {
              (dscacheutil -flushcache; killall -HUP mDNSResponder || true) && \
              rm -f {tmp_q}"
         );
-        // wrap in AppleScript (esc_applescript is defensive — shell_cmd has no double quotes)
         let script = format!(
             "do shell script \"{}\" with administrator privileges",
             esc_applescript(&shell_cmd)
         );
-
-        // 3) run osascript and wait (we care about success / cancel)
         let output = std::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
             .output()
             .map_err(|e| e.to_string())?;
-
-        // belt-and-suspenders cleanup if install failed before the rm
         let _ = std::fs::remove_file(&tmp);
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let code = output.status.code().unwrap_or(-1);
-            let msg = stderr.trim();
-            // user clicked Cancel on the system password prompt
-            if msg.contains("-128")
-                || msg.to_lowercase().contains("user canceled")
-                || msg.contains("用户取消")
-            {
-                return Err("用户取消授权".into());
-            }
-            if msg.is_empty() {
-                return Err(format!("应用失败（退出码 {}）", code));
-            }
-            return Err(msg.to_string());
+            return Err(osascript_err(
+                &String::from_utf8_lossy(&output.stderr),
+                &format!("应用失败（退出码 {}）", output.status.code().unwrap_or(-1)),
+            ));
         }
         Ok(())
     })
@@ -912,6 +1064,24 @@ async fn apply_hosts(content: String) -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 #[tauri::command]
 async fn apply_hosts(_content: String) -> Result<(), String> {
+    Err("unsupported platform".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+fn is_hosts_helper_ready() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn install_hosts_helper() -> Result<(), String> {
+    Err("unsupported platform".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+async fn uninstall_hosts_helper() -> Result<(), String> {
     Err("unsupported platform".into())
 }
 
@@ -2291,7 +2461,10 @@ pub fn run() {
             open_in_vscode,
             open_in_terminal,
             apply_hosts,
-            read_system_hosts
+            read_system_hosts,
+            is_hosts_helper_ready,
+            install_hosts_helper,
+            uninstall_hosts_helper
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

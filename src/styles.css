@@ -2744,6 +2744,32 @@ body {
   color: var(--text-secondary);
 }
 
+.host-helper-btn {
+  margin-left: auto;
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s;
+}
+.host-helper-btn:hover {
+  color: var(--text);
+  border-color: var(--text-secondary);
+}
+.host-helper-btn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.host-helper-btn.on:hover {
+  color: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
 /* 行号 + 高亮编辑器（textarea 与 pre 逐像素对齐） */
 
 .host-editor {

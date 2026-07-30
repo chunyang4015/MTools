@@ -273,6 +273,7 @@ export default {
       <div class="host-main-head">
         <span class="host-main-title">${escapeHtml(g.name)}</span>
         <span class="host-main-hint">${hint}</span>
+        <button class="host-helper-btn" id="host-helper-btn" title="免密服务"></button>
       </div>
       <div class="host-editor">
         <div class="host-gutter" id="host-gutter"></div>
@@ -291,6 +292,11 @@ export default {
     this._textarea.value = g.content || '';
     this._bindEditor();
     this._syncEditor();
+
+    this._helperReady = false;
+    const helperBtn = this._main.querySelector('#host-helper-btn');
+    if (helperBtn) helperBtn.addEventListener('click', () => this._toggleHelper());
+    this._refreshHelperBtn();
   },
 
   _highlightHosts(text) {
@@ -328,8 +334,22 @@ export default {
       this._highlight.scrollLeft = ta.scrollLeft;
       this._gutter.scrollTop = ta.scrollTop;
     });
-    // Tab inserts two spaces (hosts editing convenience)
     ta.addEventListener('keydown', (e) => {
+      // Toggle '#' comment on the caret line (or selection) with Cmd+/ — no manual '#' needed.
+      if (e.metaKey && e.key === '/') {
+        e.preventDefault();
+        this._toggleLineComments();
+        return;
+      }
+      // Save & apply with Cmd+S — flush + persist, then write to /etc/hosts immediately.
+      if (e.metaKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        this._flushContent();
+        this._saveState();
+        this._doApply();
+        return;
+      }
+      // Tab inserts two spaces (hosts editing convenience)
       if (e.key === 'Tab') {
         e.preventDefault();
         const s = ta.selectionStart;
@@ -340,6 +360,46 @@ export default {
         this._onContentChange();
       }
     });
+  },
+
+  // Toggle the '#' comment prefix on the caret line, or every line spanned by the selection.
+  // Uncomment only when every non-blank target line is already commented; otherwise comment them.
+  _toggleLineComments() {
+    const ta = this._textarea;
+    if (!ta) return;
+    const v = ta.value;
+    const selStart = ta.selectionStart;
+    const selEnd = ta.selectionEnd;
+
+    const lineStart = v.lastIndexOf('\n', selStart) + 1;
+    let lineEnd = v.indexOf('\n', selEnd);
+    if (lineEnd === -1) lineEnd = v.length;
+
+    const lines = v.slice(lineStart, lineEnd).split('\n');
+    const isCommented = (line) => /^\s*#/.test(line);
+    const nonEmpty = lines.filter((l) => l.trim() !== '');
+    const allCommented = nonEmpty.length > 0 && nonEmpty.every(isCommented);
+
+    const transformed = lines.map((line) => {
+      if (line.trim() === '') return line; // skip blank lines
+      return allCommented
+        ? line.replace(/^(\s*)#\s?/, '$1')
+        : line.replace(/^(\s*)/, '$1# ');
+    });
+
+    const newBlock = transformed.join('\n');
+    ta.value = v.slice(0, lineStart) + newBlock + v.slice(lineEnd);
+
+    if (selStart !== selEnd) {
+      // Keep the block selected so the shortcut can be toggled again immediately.
+      ta.selectionStart = lineStart;
+      ta.selectionEnd = lineStart + newBlock.length;
+    } else {
+      ta.selectionStart = ta.selectionEnd = lineStart + transformed[0].length;
+    }
+
+    this._syncEditor();
+    this._onContentChange();
   },
 
   _switchGroup(id) {
@@ -392,6 +452,65 @@ export default {
     if (id === this._activeId) {
       const hintEl = this._main.querySelector('.host-main-hint');
       if (hintEl) hintEl.textContent = enabled ? '已启用 · 参与合并' : '未启用 · 不参与合并';
+    }
+    // Apply immediately so toggling takes effect without pressing the toolbar button.
+    this._autoApply();
+  },
+
+  // Passwordless helper: status read, install/uninstall, and silent auto-apply on toggle.
+  async _isHelperReady() {
+    if (!window.__TAURI__) return false;
+    try {
+      return await window.__TAURI__.core.invoke('is_hosts_helper_ready');
+    } catch {
+      return false;
+    }
+  },
+
+  async _refreshHelperBtn() {
+    const btn = this._main?.querySelector('#host-helper-btn');
+    if (!btn) return;
+    this._helperReady = await this._isHelperReady();
+    btn.textContent = this._helperReady ? '免密服务：已启用' : '免密服务：未启用';
+    btn.classList.toggle('on', this._helperReady);
+    btn.title = this._helperReady
+      ? '已开启免密 · 切换分组自动生效 · 点击卸载'
+      : '开启后切换分组免密自动生效（仅需授权一次）· 点击开启';
+  },
+
+  async _toggleHelper() {
+    if (!window.__TAURI__) {
+      this._setStatus('不可用（非应用环境）', 'err');
+      return;
+    }
+    const enabling = !this._helperReady;
+    this._setStatus(enabling ? '安装中，请在系统弹窗输入密码…' : '卸载中，请在系统弹窗输入密码…', 'info');
+    try {
+      await window.__TAURI__.core.invoke(enabling ? 'install_hosts_helper' : 'uninstall_hosts_helper');
+      this._setStatus(enabling ? '已开启免密，切换分组将自动生效' : '已关闭免密服务', 'ok');
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('取消')) this._setStatus('已取消授权', 'muted');
+      else this._setStatus((enabling ? '安装' : '卸载') + '失败：' + msg, 'err');
+    }
+    this._refreshHelperBtn();
+  },
+
+  // Apply silently after a toggle when the passwordless helper is installed.
+  async _autoApply() {
+    const ready = await this._isHelperReady();
+    if (!ready) {
+      this._setStatus('未开启免密 · 点击右上「免密服务」即可自动生效', 'muted');
+      return;
+    }
+    this._flushContent();
+    try {
+      await window.__TAURI__.core.invoke('apply_hosts', { content: this._mergeHosts() });
+      this._setStatus('已自动应用到 /etc/hosts', 'ok');
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('取消')) return;
+      this._setStatus('自动应用失败：' + msg, 'err');
     }
   },
 
@@ -518,7 +637,30 @@ export default {
       this._setStatus('应用不可用（非应用环境）', 'err');
       return;
     }
-    this._setStatus('正在应用，请在系统弹窗输入密码…', 'info');
+
+    // First apply auto-enables the passwordless helper, so toggles and later applies need no password.
+    if (!(await this._isHelperReady())) {
+      this._setStatus('首次应用：开启免密服务，请在系统弹窗输入密码…', 'info');
+      let installed = false;
+      try {
+        await window.__TAURI__.core.invoke('install_hosts_helper');
+        installed = true;
+      } catch (err) {
+        const msg = String(err);
+        if (msg.includes('取消')) {
+          // declined the helper — still honor this apply via the one-shot password prompt
+          this._setStatus('未开启免密，正在应用…', 'info');
+        } else {
+          this._setStatus('开启免密失败：' + msg, 'err');
+          return;
+        }
+      }
+      await this._refreshHelperBtn();
+      if (installed) this._setStatus('免密已开启，正在应用…', 'info');
+    } else {
+      this._setStatus('正在应用…', 'info');
+    }
+
     try {
       await window.__TAURI__.core.invoke('apply_hosts', { content: this._mergeHosts() });
       this._setStatus('已应用到 /etc/hosts（浏览器 DNS 缓存需重启浏览器生效）', 'ok');
